@@ -71,8 +71,8 @@ func LoadConfig() *Config {
 	consumerFetchSize := getEnvAsInt("CONSUMER_FETCH_SIZE", 1024*1024) // Default 1MB
 	realtimeMode := getEnvAsBool("REALTIME_MODE", true)                // Default enable realtime
 	producerFlushInterval := getEnvAsInt("PRODUCER_FLUSH_INTERVAL", 1) // Default 1ms for realtime
-	producerBufferSize := getEnvAsInt("PRODUCER_BUFFER_SIZE", 10000)   // Default 10k buffer
-	producerMaxRetries := getEnvAsInt("PRODUCER_MAX_RETRIES", 3)       // Default 3 retries
+	producerBufferSize := getEnvAsInt("PRODUCER_BUFFER_SIZE", 50000)   // Default 50k buffer for high throughput
+	producerMaxRetries := getEnvAsInt("PRODUCER_MAX_RETRIES", 5)       // Default 5 retries
 
 	return &Config{
 		KafkaBrokers:          brokers,

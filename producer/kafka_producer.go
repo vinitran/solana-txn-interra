@@ -111,16 +111,16 @@ func (kp *KafkaProducer) PublishRollingStats(stats *models.RollingStats) error {
 		Timestamp: time.Now(),
 	}
 
-	// Retry logic with exponential backoff
+	// Retry logic with exponential backoff and longer timeout
 	maxRetries := kp.config.ProducerMaxRetries
-	baseTimeout := 1 * time.Millisecond
+	baseTimeout := 5 * time.Millisecond // Start with 5ms instead of 1ms
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		select {
 		case kp.producer.Input() <- message:
 			return nil
 		case <-time.After(baseTimeout * time.Duration(1<<uint(attempt))):
-			// Exponential backoff: 1ms, 2ms, 4ms, 8ms...
+			// Exponential backoff: 5ms, 10ms, 20ms, 40ms, 80ms...
 			if attempt == maxRetries-1 {
 				// Last attempt failed, try sync producer as fallback
 				atomic.AddInt64(&kp.dropped, 1)

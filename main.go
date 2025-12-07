@@ -8,95 +8,55 @@ import (
 	"solana-txn-interra/config"
 	"solana-txn-interra/consumer"
 	"solana-txn-interra/models"
-	"solana-txn-interra/processor"
 	"solana-txn-interra/producer"
 	"solana-txn-interra/worker"
 	"syscall"
 	"time"
 )
 
-// TransactionHandler implements consumer.MessageHandler with worker pool
+// TransactionHandler implements consumer.MessageHandler - pushes to Redis queue
 type TransactionHandler struct {
-	processor       processor.Processor
-	cachedProcessor *processor.CachedStatsProcessor
-	producer        *producer.KafkaProducer
-	workerPool      *worker.Pool
+	redisQueue *cache.RedisQueue
 }
 
-// HandleTransaction submits transaction to worker pool for async processing
+// HandleTransaction pushes transaction to Redis queue
 func (th *TransactionHandler) HandleTransaction(txn models.Transaction) error {
-	// Submit to worker pool for async processing
-	th.workerPool.Submit(worker.Job{
-		Transaction: txn,
-		ProcessFunc: th.processTransaction,
-		PublishFunc: th.publishStats,
-	})
-	return nil
-}
-
-// processTransaction processes a transaction and returns rolling stats
-func (th *TransactionHandler) processTransaction(txn models.Transaction) (*models.RollingStats, error) {
-	var stats *models.RollingStats
-
-	// Use cached processor if available, otherwise use regular processor
-	if th.cachedProcessor != nil {
-		stats = th.cachedProcessor.ProcessTransaction(txn)
-	} else if th.processor != nil {
-		stats = th.processor.ProcessTransaction(txn)
-	} else {
-		return nil, nil
-	}
-
-	return stats, nil
-}
-
-// publishStats publishes rolling stats to Kafka (realtime mode)
-func (th *TransactionHandler) publishStats(stats *models.RollingStats) error {
-	if stats == nil {
-		return nil
-	}
-	// Always use async publish for realtime (non-blocking)
-	return th.producer.PublishRollingStats(stats)
+	// Push transaction to Redis queue
+	return th.redisQueue.PushTransaction(txn)
 }
 
 func main() {
 	// Load configuration
 	cfg := config.LoadConfig()
 
-	// Initialize Redis cache if enabled
-	var redisCache *cache.RedisCache
-	var err error
-	if cfg.RedisEnabled {
-		redisCache, err = cache.NewRedisCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, true)
-		if err != nil {
-			log.Printf("Warning: Failed to initialize Redis cache: %v. Continuing without Redis.", err)
-			redisCache = nil
-		} else {
-			log.Println("Redis cache initialized successfully")
-			defer redisCache.Close()
-		}
+	if !cfg.RedisEnabled {
+		log.Fatalf("Redis must be enabled for Redis-first architecture. Set REDIS_ENABLED=true")
 	}
+
+	// Initialize Redis queue
+	redisQueue, err := cache.NewRedisQueue(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, true)
+	if err != nil {
+		log.Fatalf("Failed to initialize Redis queue: %v", err)
+	}
+	defer redisQueue.Close()
+	log.Println("Redis queue initialized successfully")
+
+	// Initialize Redis cache
+	redisCache, err := cache.NewRedisCache(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB, true)
+	if err != nil {
+		log.Fatalf("Failed to initialize Redis cache: %v", err)
+	}
+	defer redisCache.Close()
+	log.Println("Redis cache initialized successfully")
 
 	// Initialize local cache
 	localCache := cache.NewLocalCache(cfg.LocalCacheSize, time.Duration(cfg.LocalCacheTTL)*time.Second)
 	log.Printf("Local cache initialized: size=%d, ttl=%ds", cfg.LocalCacheSize, cfg.LocalCacheTTL)
 
-	// Initialize worker pool
-	workerPool := worker.NewPool(cfg.WorkerPoolSize, cfg.WorkerPoolSize*2) // Queue size = 2x workers
-	workerPool.Start()
-	defer workerPool.Stop()
-
-	// Initialize processor (use cached processor if Redis is enabled, otherwise use regular)
-	var proc processor.Processor
-	var cachedProc *processor.CachedStatsProcessor
-	if cfg.RedisEnabled && redisCache != nil {
-		cachedProc = processor.NewCachedStatsProcessor(redisCache, localCache)
-		defer cachedProc.Close()
-		log.Println("Using cached processor with Redis")
-	} else {
-		proc = processor.NewStatsProcessor()
-		log.Println("Using regular processor without Redis")
-	}
+	// Initialize processor worker (reads from Redis, processes, writes to Redis)
+	processorWorker := worker.NewRedisProcessorWorker(redisQueue, redisCache, localCache, cfg.WorkerPoolSize)
+	processorWorker.Start()
+	defer processorWorker.Stop()
 
 	// Initialize producer
 	kafkaProducer, err := producer.NewKafkaProducer(cfg)
@@ -105,16 +65,18 @@ func main() {
 	}
 	defer kafkaProducer.Close()
 
-	// Create handler with worker pool
+	// Initialize publisher worker (reads from Redis, publishes to Kafka)
+	publisherWorker := worker.NewRedisPublisherWorker(redisQueue, kafkaProducer, cfg.WorkerPoolSize/2) // Half workers for publishing
+	publisherWorker.Start()
+	defer publisherWorker.Stop()
+
+	// Create handler (only pushes to Redis)
 	handler := &TransactionHandler{
-		processor:       proc,
-		cachedProcessor: cachedProc,
-		producer:        kafkaProducer,
-		workerPool:      workerPool,
+		redisQueue: redisQueue,
 	}
 
 	// Start metrics reporting goroutine
-	go reportMetrics(workerPool, kafkaProducer)
+	go reportMetricsRedis(processorWorker, publisherWorker, kafkaProducer, redisQueue)
 
 	// Initialize consumer
 	kafkaConsumer, err := consumer.NewKafkaConsumer(cfg, handler)
@@ -142,22 +104,36 @@ func main() {
 	log.Println("Shutting down...")
 }
 
-// reportMetrics periodically reports processing metrics
-func reportMetrics(workerPool *worker.Pool, producer *producer.KafkaProducer) {
+// reportMetricsRedis periodically reports processing metrics for Redis-first architecture
+func reportMetricsRedis(processorWorker *worker.RedisProcessorWorker, publisherWorker *worker.RedisPublisherWorker, producer *producer.KafkaProducer, redisQueue *cache.RedisQueue) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		processed := workerPool.GetProcessed()
-		errors := workerPool.GetErrors()
-		tps := workerPool.GetTPS()
+		processed := processorWorker.GetProcessed()
+		procErrors := processorWorker.GetErrors()
+		published := publisherWorker.GetPublished()
+		pubErrors := publisherWorker.GetErrors()
 		successes, prodErrors, dropped := producer.GetStats()
 
-		log.Printf("Metrics - Processed: %d, Errors: %d, TPS: %.2f, Published: %d, Publish Errors: %d, Dropped: %d",
-			processed, errors, tps, successes, prodErrors, dropped)
+		// Get queue lengths
+		txnQueueLen, _ := redisQueue.GetQueueLength("queue:transactions")
+		statsQueueLen, _ := redisQueue.GetQueueLength("queue:rolling-stats")
+
+		log.Printf("Metrics - Processed: %d, Proc Errors: %d, Published: %d, Pub Errors: %d, Kafka Published: %d, Kafka Errors: %d, Dropped: %d",
+			processed, procErrors, published, pubErrors, successes, prodErrors, dropped)
+		log.Printf("Queue Lengths - Transactions: %d, Rolling Stats: %d", txnQueueLen, statsQueueLen)
 
 		if dropped > 0 {
 			log.Printf("WARNING: %d messages dropped due to producer queue full. Consider increasing PRODUCER_BUFFER_SIZE", dropped)
+		}
+
+		if txnQueueLen > 10000 {
+			log.Printf("WARNING: Transaction queue is backing up (%d messages). Consider increasing processor workers.", txnQueueLen)
+		}
+
+		if statsQueueLen > 10000 {
+			log.Printf("WARNING: Stats queue is backing up (%d messages). Consider increasing publisher workers.", statsQueueLen)
 		}
 	}
 }
