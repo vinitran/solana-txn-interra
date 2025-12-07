@@ -50,11 +50,12 @@ func (th *TransactionHandler) processTransaction(txn models.Transaction) (*model
 	return stats, nil
 }
 
-// publishStats publishes rolling stats to Kafka
+// publishStats publishes rolling stats to Kafka (realtime mode)
 func (th *TransactionHandler) publishStats(stats *models.RollingStats) error {
 	if stats == nil {
 		return nil
 	}
+	// Always use async publish for realtime (non-blocking)
 	return th.producer.PublishRollingStats(stats)
 }
 

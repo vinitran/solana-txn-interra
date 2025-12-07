@@ -22,18 +22,33 @@ type KafkaProducer struct {
 	closed       int32
 }
 
-// NewKafkaProducer creates a new async Kafka producer for high throughput
+// NewKafkaProducer creates a new async Kafka producer optimized for realtime
 func NewKafkaProducer(cfg *config.Config) (*KafkaProducer, error) {
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_8_0_0
 	config.Producer.Return.Successes = true
 	config.Producer.Return.Errors = true
-	config.Producer.RequiredAcks = sarama.WaitForLocal // Faster than WaitForAll
-	config.Producer.Retry.Max = 3
-	config.Producer.Flush.Frequency = 10 * time.Millisecond // Flush every 10ms
-	config.Producer.Flush.Messages = cfg.ProducerBatchSize
-	config.Producer.Flush.Bytes = 1024 * 1024              // 1MB
-	config.Producer.Compression = sarama.CompressionSnappy // Compress for better throughput
+	config.Producer.RequiredAcks = sarama.WaitForLocal // Fastest: don't wait for all replicas
+	config.Producer.Retry.Max = 2                      // Reduce retries for lower latency
+	config.Producer.Timeout = 5 * time.Second          // Shorter timeout
+
+	// Optimize for realtime mode
+	if cfg.RealtimeMode {
+		// Realtime: flush immediately, no batching
+		config.Producer.Flush.Frequency = time.Duration(cfg.ProducerFlushInterval) * time.Millisecond
+		config.Producer.Flush.Messages = 1                   // Flush after 1 message
+		config.Producer.Flush.Bytes = 0                      // No byte-based batching
+		config.Producer.Compression = sarama.CompressionNone // No compression for lower latency
+		config.Producer.MaxMessageBytes = 1000000            // 1MB max message size
+		log.Printf("Producer configured for REALTIME mode (flush: %dms, no batching, no compression)", cfg.ProducerFlushInterval)
+	} else {
+		// Throughput mode: batch for better throughput
+		config.Producer.Flush.Frequency = 10 * time.Millisecond
+		config.Producer.Flush.Messages = cfg.ProducerBatchSize
+		config.Producer.Flush.Bytes = 1024 * 1024 // 1MB
+		config.Producer.Compression = sarama.CompressionSnappy
+		log.Printf("Producer configured for THROUGHPUT mode (batch: %d, compression enabled)", cfg.ProducerBatchSize)
+	}
 
 	// Configure SASL if provided
 	if cfg.KafkaSecurityProtocol != "" {
@@ -72,7 +87,6 @@ func NewKafkaProducer(cfg *config.Config) (*KafkaProducer, error) {
 	go kp.handleSuccesses()
 	go kp.handleErrors()
 
-	log.Printf("Async Kafka producer initialized with batch size: %d", cfg.ProducerBatchSize)
 	return kp, nil
 }
 
@@ -91,13 +105,20 @@ func (kp *KafkaProducer) PublishRollingStats(stats *models.RollingStats) error {
 		Topic: kp.config.KafkaOutputTopic,
 		Key:   sarama.StringEncoder(stats.PairID),
 		Value: sarama.ByteEncoder(jsonData),
+		// Set timestamp for better ordering
+		Timestamp: time.Now(),
 	}
 
-	// Non-blocking send
+	// Non-blocking send with shorter timeout for realtime
+	timeout := 10 * time.Millisecond
+	if !kp.config.RealtimeMode {
+		timeout = 100 * time.Millisecond
+	}
+
 	select {
 	case kp.producer.Input() <- message:
 		return nil
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(timeout):
 		return fmt.Errorf("producer queue full, message dropped")
 	}
 }

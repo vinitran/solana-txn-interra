@@ -24,10 +24,12 @@ type Config struct {
 	RedisDB               int
 	RedisEnabled          bool
 	LocalCacheSize        int
-	LocalCacheTTL         int // seconds
-	WorkerPoolSize        int // Number of worker goroutines
-	ProducerBatchSize     int // Batch size for async producer
-	ConsumerFetchSize     int // Kafka consumer fetch size
+	LocalCacheTTL         int  // seconds
+	WorkerPoolSize        int  // Number of worker goroutines
+	ProducerBatchSize     int  // Batch size for async producer
+	ConsumerFetchSize     int  // Kafka consumer fetch size
+	RealtimeMode          bool // Enable realtime mode (low latency, no batching)
+	ProducerFlushInterval int  // Flush interval in milliseconds
 }
 
 // LoadConfig loads configuration from environment variables and .env file
@@ -65,6 +67,8 @@ func LoadConfig() *Config {
 	workerPoolSize := getEnvAsInt("WORKER_POOL_SIZE", 100)             // Default 100 workers
 	producerBatchSize := getEnvAsInt("PRODUCER_BATCH_SIZE", 100)       // Default batch 100
 	consumerFetchSize := getEnvAsInt("CONSUMER_FETCH_SIZE", 1024*1024) // Default 1MB
+	realtimeMode := getEnvAsBool("REALTIME_MODE", true)                // Default enable realtime
+	producerFlushInterval := getEnvAsInt("PRODUCER_FLUSH_INTERVAL", 1) // Default 1ms for realtime
 
 	return &Config{
 		KafkaBrokers:          brokers,
@@ -84,6 +88,8 @@ func LoadConfig() *Config {
 		WorkerPoolSize:        workerPoolSize,
 		ProducerBatchSize:     producerBatchSize,
 		ConsumerFetchSize:     consumerFetchSize,
+		RealtimeMode:          realtimeMode,
+		ProducerFlushInterval: producerFlushInterval,
 	}
 }
 
@@ -158,4 +164,6 @@ func (c *Config) PrintConfig() {
 	log.Printf("  Worker Pool Size: %d", c.WorkerPoolSize)
 	log.Printf("  Producer Batch Size: %d", c.ProducerBatchSize)
 	log.Printf("  Consumer Fetch Size: %d bytes", c.ConsumerFetchSize)
+	log.Printf("  Realtime Mode: %v", c.RealtimeMode)
+	log.Printf("  Producer Flush Interval: %d ms", c.ProducerFlushInterval)
 }
