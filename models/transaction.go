@@ -1,6 +1,11 @@
 package models
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"time"
+)
 
 // Transaction represents a transaction from Kafka topic transaction-v3
 type Transaction struct {
@@ -41,4 +46,44 @@ type Transaction struct {
 	Volume          float64   `json:"volume"`
 	ChainNetwork    string    `json:"chain_network"`
 	Index           float64   `json:"index"`
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling to handle bonding_curve as number, string, or null
+func (t *Transaction) UnmarshalJSON(data []byte) error {
+	// Use a temporary struct with interface{} for bonding_curve
+	type Alias Transaction
+	aux := &struct {
+		BondingCurve interface{} `json:"bonding_curve"`
+		*Alias
+	}{
+		Alias: (*Alias)(t),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	// Handle bonding_curve: can be null, string, or number
+	if aux.BondingCurve == nil {
+		t.BondingCurve = nil
+	} else {
+		var bondingCurveStr string
+		switch v := aux.BondingCurve.(type) {
+		case string:
+			bondingCurveStr = v
+		case float64:
+			// Convert number to string
+			bondingCurveStr = strconv.FormatFloat(v, 'f', -1, 64)
+		case int:
+			bondingCurveStr = strconv.Itoa(v)
+		case int64:
+			bondingCurveStr = strconv.FormatInt(v, 10)
+		default:
+			// Try to convert to string
+			bondingCurveStr = fmt.Sprintf("%v", v)
+		}
+		t.BondingCurve = &bondingCurveStr
+	}
+
+	return nil
 }
