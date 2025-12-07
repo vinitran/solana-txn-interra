@@ -19,6 +19,7 @@ type KafkaProducer struct {
 	config       *config.Config
 	successes    int64
 	errors       int64
+	dropped      int64 // Messages dropped due to queue full
 	closed       int32
 }
 
@@ -31,6 +32,7 @@ func NewKafkaProducer(cfg *config.Config) (*KafkaProducer, error) {
 	config.Producer.RequiredAcks = sarama.WaitForLocal // Fastest: don't wait for all replicas
 	config.Producer.Retry.Max = 2                      // Reduce retries for lower latency
 	config.Producer.Timeout = 5 * time.Second          // Shorter timeout
+	config.ChannelBufferSize = cfg.ProducerBufferSize  // Large buffer to prevent queue full
 
 	// Optimize for realtime mode
 	if cfg.RealtimeMode {
@@ -90,7 +92,7 @@ func NewKafkaProducer(cfg *config.Config) (*KafkaProducer, error) {
 	return kp, nil
 }
 
-// PublishRollingStats publishes rolling statistics to Kafka asynchronously
+// PublishRollingStats publishes rolling statistics to Kafka asynchronously with retry
 func (kp *KafkaProducer) PublishRollingStats(stats *models.RollingStats) error {
 	if atomic.LoadInt32(&kp.closed) == 1 {
 		return fmt.Errorf("producer is closed")
@@ -109,18 +111,44 @@ func (kp *KafkaProducer) PublishRollingStats(stats *models.RollingStats) error {
 		Timestamp: time.Now(),
 	}
 
-	// Non-blocking send with shorter timeout for realtime
-	timeout := 10 * time.Millisecond
-	if !kp.config.RealtimeMode {
-		timeout = 100 * time.Millisecond
+	// Retry logic with exponential backoff
+	maxRetries := kp.config.ProducerMaxRetries
+	baseTimeout := 1 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		select {
+		case kp.producer.Input() <- message:
+			return nil
+		case <-time.After(baseTimeout * time.Duration(1<<uint(attempt))):
+			// Exponential backoff: 1ms, 2ms, 4ms, 8ms...
+			if attempt == maxRetries-1 {
+				// Last attempt failed, try sync producer as fallback
+				atomic.AddInt64(&kp.dropped, 1)
+				return kp.publishWithSyncFallback(stats, jsonData)
+			}
+			// Continue to next retry
+		}
 	}
 
-	select {
-	case kp.producer.Input() <- message:
-		return nil
-	case <-time.After(timeout):
-		return fmt.Errorf("producer queue full, message dropped")
+	// Should not reach here, but fallback to sync
+	atomic.AddInt64(&kp.dropped, 1)
+	return kp.publishWithSyncFallback(stats, jsonData)
+}
+
+// publishWithSyncFallback publishes using sync producer when async queue is full
+func (kp *KafkaProducer) publishWithSyncFallback(stats *models.RollingStats, jsonData []byte) error {
+	message := &sarama.ProducerMessage{
+		Topic:     kp.config.KafkaOutputTopic,
+		Key:       sarama.StringEncoder(stats.PairID),
+		Value:     sarama.ByteEncoder(jsonData),
+		Timestamp: time.Now(),
 	}
+
+	_, _, err := kp.syncProducer.SendMessage(message)
+	if err != nil {
+		return fmt.Errorf("sync fallback also failed: %w", err)
+	}
+	return nil
 }
 
 // PublishRollingStatsSync publishes rolling statistics synchronously (for critical messages)
@@ -157,8 +185,8 @@ func (kp *KafkaProducer) handleErrors() {
 }
 
 // GetStats returns producer statistics
-func (kp *KafkaProducer) GetStats() (successes, errors int64) {
-	return atomic.LoadInt64(&kp.successes), atomic.LoadInt64(&kp.errors)
+func (kp *KafkaProducer) GetStats() (successes, errors, dropped int64) {
+	return atomic.LoadInt64(&kp.successes), atomic.LoadInt64(&kp.errors), atomic.LoadInt64(&kp.dropped)
 }
 
 // Close closes the producer

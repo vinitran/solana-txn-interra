@@ -151,9 +151,13 @@ func reportMetrics(workerPool *worker.Pool, producer *producer.KafkaProducer) {
 		processed := workerPool.GetProcessed()
 		errors := workerPool.GetErrors()
 		tps := workerPool.GetTPS()
-		successes, prodErrors := producer.GetStats()
+		successes, prodErrors, dropped := producer.GetStats()
 
-		log.Printf("Metrics - Processed: %d, Errors: %d, TPS: %.2f, Published: %d, Publish Errors: %d",
-			processed, errors, tps, successes, prodErrors)
+		log.Printf("Metrics - Processed: %d, Errors: %d, TPS: %.2f, Published: %d, Publish Errors: %d, Dropped: %d",
+			processed, errors, tps, successes, prodErrors, dropped)
+
+		if dropped > 0 {
+			log.Printf("WARNING: %d messages dropped due to producer queue full. Consider increasing PRODUCER_BUFFER_SIZE", dropped)
+		}
 	}
 }
