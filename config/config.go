@@ -25,6 +25,9 @@ type Config struct {
 	RedisEnabled          bool
 	LocalCacheSize        int
 	LocalCacheTTL         int // seconds
+	WorkerPoolSize        int // Number of worker goroutines
+	ProducerBatchSize     int // Batch size for async producer
+	ConsumerFetchSize     int // Kafka consumer fetch size
 }
 
 // LoadConfig loads configuration from environment variables and .env file
@@ -38,7 +41,11 @@ func LoadConfig() *Config {
 	_ = godotenv.Overload(".env.local")
 
 	// Parse Kafka brokers (support comma-separated list)
-	brokersStr := getEnv("KAFKA_BROKERS", "localhost:9092")
+	// Support both KAFKA_BROKERS and KAFKA_BOOTSTRAP_SERVERS (for compatibility)
+	brokersStr := getEnv("KAFKA_BROKERS", "")
+	if brokersStr == "" {
+		brokersStr = getEnv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+	}
 	brokers := strings.Split(brokersStr, ",")
 	for i := range brokers {
 		brokers[i] = strings.TrimSpace(brokers[i])
@@ -55,6 +62,9 @@ func LoadConfig() *Config {
 
 	localCacheSize := getEnvAsInt("LOCAL_CACHE_SIZE", 10000)
 	localCacheTTL := getEnvAsInt("LOCAL_CACHE_TTL", 60)
+	workerPoolSize := getEnvAsInt("WORKER_POOL_SIZE", 100)             // Default 100 workers
+	producerBatchSize := getEnvAsInt("PRODUCER_BATCH_SIZE", 100)       // Default batch 100
+	consumerFetchSize := getEnvAsInt("CONSUMER_FETCH_SIZE", 1024*1024) // Default 1MB
 
 	return &Config{
 		KafkaBrokers:          brokers,
@@ -71,6 +81,9 @@ func LoadConfig() *Config {
 		RedisEnabled:          redisEnabled,
 		LocalCacheSize:        localCacheSize,
 		LocalCacheTTL:         localCacheTTL,
+		WorkerPoolSize:        workerPoolSize,
+		ProducerBatchSize:     producerBatchSize,
+		ConsumerFetchSize:     consumerFetchSize,
 	}
 }
 
@@ -142,4 +155,7 @@ func (c *Config) PrintConfig() {
 	}
 	log.Printf("  Local Cache Size: %d", c.LocalCacheSize)
 	log.Printf("  Local Cache TTL: %d seconds", c.LocalCacheTTL)
+	log.Printf("  Worker Pool Size: %d", c.WorkerPoolSize)
+	log.Printf("  Producer Batch Size: %d", c.ProducerBatchSize)
+	log.Printf("  Consumer Fetch Size: %d bytes", c.ConsumerFetchSize)
 }

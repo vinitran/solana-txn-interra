@@ -10,19 +10,32 @@ import (
 	"solana-txn-interra/models"
 	"solana-txn-interra/processor"
 	"solana-txn-interra/producer"
+	"solana-txn-interra/worker"
 	"syscall"
 	"time"
 )
 
-// TransactionHandler implements consumer.MessageHandler
+// TransactionHandler implements consumer.MessageHandler with worker pool
 type TransactionHandler struct {
 	processor       processor.Processor
 	cachedProcessor *processor.CachedStatsProcessor
 	producer        *producer.KafkaProducer
+	workerPool      *worker.Pool
 }
 
-// HandleTransaction processes a transaction and publishes rolling stats
+// HandleTransaction submits transaction to worker pool for async processing
 func (th *TransactionHandler) HandleTransaction(txn models.Transaction) error {
+	// Submit to worker pool for async processing
+	th.workerPool.Submit(worker.Job{
+		Transaction: txn,
+		ProcessFunc: th.processTransaction,
+		PublishFunc: th.publishStats,
+	})
+	return nil
+}
+
+// processTransaction processes a transaction and returns rolling stats
+func (th *TransactionHandler) processTransaction(txn models.Transaction) (*models.RollingStats, error) {
 	var stats *models.RollingStats
 
 	// Use cached processor if available, otherwise use regular processor
@@ -31,16 +44,18 @@ func (th *TransactionHandler) HandleTransaction(txn models.Transaction) error {
 	} else if th.processor != nil {
 		stats = th.processor.ProcessTransaction(txn)
 	} else {
-		log.Printf("Error: no processor available")
+		return nil, nil
+	}
+
+	return stats, nil
+}
+
+// publishStats publishes rolling stats to Kafka
+func (th *TransactionHandler) publishStats(stats *models.RollingStats) error {
+	if stats == nil {
 		return nil
 	}
-
-	// Publish rolling stats to Kafka
-	if err := th.producer.PublishRollingStats(stats); err != nil {
-		return err
-	}
-
-	return nil
+	return th.producer.PublishRollingStats(stats)
 }
 
 func main() {
@@ -65,22 +80,20 @@ func main() {
 	localCache := cache.NewLocalCache(cfg.LocalCacheSize, time.Duration(cfg.LocalCacheTTL)*time.Second)
 	log.Printf("Local cache initialized: size=%d, ttl=%ds", cfg.LocalCacheSize, cfg.LocalCacheTTL)
 
+	// Initialize worker pool
+	workerPool := worker.NewPool(cfg.WorkerPoolSize, cfg.WorkerPoolSize*2) // Queue size = 2x workers
+	workerPool.Start()
+	defer workerPool.Stop()
+
 	// Initialize processor (use cached processor if Redis is enabled, otherwise use regular)
-	var handler *TransactionHandler
+	var proc processor.Processor
+	var cachedProc *processor.CachedStatsProcessor
 	if cfg.RedisEnabled && redisCache != nil {
-		cachedProcessor := processor.NewCachedStatsProcessor(redisCache, localCache)
-		defer cachedProcessor.Close()
-		handler = &TransactionHandler{
-			cachedProcessor: cachedProcessor,
-			producer:        nil, // Will be set below
-		}
+		cachedProc = processor.NewCachedStatsProcessor(redisCache, localCache)
+		defer cachedProc.Close()
 		log.Println("Using cached processor with Redis")
 	} else {
-		statsProcessor := processor.NewStatsProcessor()
-		handler = &TransactionHandler{
-			processor: statsProcessor,
-			producer:  nil, // Will be set below
-		}
+		proc = processor.NewStatsProcessor()
 		log.Println("Using regular processor without Redis")
 	}
 
@@ -90,7 +103,17 @@ func main() {
 		log.Fatalf("Failed to create Kafka producer: %v", err)
 	}
 	defer kafkaProducer.Close()
-	handler.producer = kafkaProducer
+
+	// Create handler with worker pool
+	handler := &TransactionHandler{
+		processor:       proc,
+		cachedProcessor: cachedProc,
+		producer:        kafkaProducer,
+		workerPool:      workerPool,
+	}
+
+	// Start metrics reporting goroutine
+	go reportMetrics(workerPool, kafkaProducer)
 
 	// Initialize consumer
 	kafkaConsumer, err := consumer.NewKafkaConsumer(cfg, handler)
@@ -111,8 +134,25 @@ func main() {
 	}()
 
 	log.Println("Transaction processor started. Press Ctrl+C to stop.")
+	cfg.PrintConfig()
 
 	// Wait for interrupt signal
 	<-sigChan
 	log.Println("Shutting down...")
+}
+
+// reportMetrics periodically reports processing metrics
+func reportMetrics(workerPool *worker.Pool, producer *producer.KafkaProducer) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		processed := workerPool.GetProcessed()
+		errors := workerPool.GetErrors()
+		tps := workerPool.GetTPS()
+		successes, prodErrors := producer.GetStats()
+
+		log.Printf("Metrics - Processed: %d, Errors: %d, TPS: %.2f, Published: %d, Publish Errors: %d",
+			processed, errors, tps, successes, prodErrors)
+	}
 }

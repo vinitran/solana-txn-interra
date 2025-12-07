@@ -7,6 +7,7 @@ import (
 	"log"
 	"solana-txn-interra/config"
 	"solana-txn-interra/models"
+	"time"
 
 	"github.com/IBM/sarama"
 )
@@ -23,12 +24,19 @@ type MessageHandler interface {
 	HandleTransaction(txn models.Transaction) error
 }
 
-// NewKafkaConsumer creates a new Kafka consumer
+// NewKafkaConsumer creates a new Kafka consumer optimized for high throughput
 func NewKafkaConsumer(cfg *config.Config, handler MessageHandler) (*KafkaConsumer, error) {
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_8_0_0
 	config.Consumer.Group.Rebalance.Strategy = sarama.NewBalanceStrategyRoundRobin()
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	
+	// Optimize for high throughput
+	config.Consumer.Fetch.Min = 1024 * 1024 // 1MB minimum
+	config.Consumer.Fetch.Default = int32(cfg.ConsumerFetchSize)
+	config.Consumer.Fetch.Max = 10 * 1024 * 1024 // 10MB maximum
+	config.Consumer.MaxProcessingTime = 5 * time.Second
+	config.ChannelBufferSize = 256 // Buffer size for message channel
 
 	// Configure SASL if provided
 	if cfg.KafkaSecurityProtocol != "" {
